@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free Games Discord Bot — monitors r/FreeGameFindings and posts to your channel."""
+"""Free Games Discord Bot — powered by r/FreeGameFindings + gg.deals links."""
 
 import discord
 import json
@@ -11,30 +11,39 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from discord.ext import commands, tasks
 from pathlib import Path
+from urllib.parse import quote
 from urllib.request import urlopen, Request
 
 # ── Configuration ───────────────────────────────────────────────────────
 TOKEN = os.environ["DISCORD_TOKEN"]
 CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", "1514351100050800763"))
 RSS_URL = "https://www.reddit.com/r/FreeGameFindings/.rss"
-LOOKBACK_HOURS = 72          # How far back to scan on first-ever run
-CHECK_INTERVAL_HOURS = 24    # How often to poll (daily check)
+LOOKBACK_HOURS = 72
+CHECK_INTERVAL_HOURS = 24
 DATA_DIR = Path("/data") if os.path.exists("/data") else Path("data")
 CACHE_FILE = DATA_DIR / "seen_games.json"
 
-# Entries matching these patterns are always skipped (megathreads, etc.)
 SKIP_PATTERNS = [
     r"discussion thread", r"mega thread", r"exiled giveaways",
     r"big offers", r"old active", r"weekly discussion",
     r"itch\.io mega", r"welcome to another", r"index",
 ]
 
-TYPE_EMOJIS = {
-    "game": "🎮", "dlc": "📦", "other": "🎁", "bundle": "📚",
-    "music": "🎵", "asset": "🖌️", "book": "📖",
+PLATFORM_COLORS = {
+    "steam": 0x1B2838,
+    "epic": 0x313131,
+    "gog": 0x8B2FC9,
+    "itch": 0xFA5C5C,
+    "itch.io": 0xFA5C5C,
+    "xbox": 0x107C10,
+    "playstation": 0x003087,
+    "ps": 0x003087,
+    "nintendo": 0xE60012,
+    "indiegala": 0xE87D2F,
+    "microsoft": 0x00A4EF,
+    "amazon": 0xFF9900,
 }
 
-# Platforms displayed first (in this order), then alphabetical
 PLATFORM_ORDER = [
     "Steam", "Epic Games", "Epic Games Mobile", "GOG",
     "itch.io", "Itch.io",
@@ -54,7 +63,7 @@ logger.setLevel(logging.INFO)
 
 # ── Bot Setup ───────────────────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = False   # Not needed — read-only bot
+intents.message_content = False
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
@@ -76,9 +85,8 @@ def save_cache(seen_ids):
     }, indent=2))
 
 
-# ── RSS Feed Parser ─────────────────────────────────────────────────────
+# ── RSS Parser ──────────────────────────────────────────────────────────
 def fetch_feed():
-    """Fetch and parse r/FreeGameFindings RSS feed."""
     headers = {
         "User-Agent": (
             "FreeGamesBot/1.0 (Discord; "
@@ -111,7 +119,6 @@ def fetch_feed():
         except (ValueError, TypeError):
             pub_time = datetime.now(timezone.utc)
 
-        # Parse: [Platform] (Type) Game Name
         platform = ""
         content_type = ""
         game_name = title
@@ -140,69 +147,149 @@ def should_skip(entry):
     return any(re.search(p, title_lower) for p in SKIP_PATTERNS)
 
 
-# ── Discord Message Builder ─────────────────────────────────────────────
-def build_embed(new_entries):
-    """Build a Discord embed from new game entries."""
-    # Group by platform
-    by_platform = {}
-    for e in new_entries:
-        plat = e["platform"] or "Other"
-        by_platform.setdefault(plat, []).append(e)
+def gg_deals_url(game_name):
+    """Build a gg.deals search URL for the given game name."""
+    clean_name = re.sub(r'[^\w\s-]', '', game_name).strip()
+    if not clean_name:
+        return None
+    return f"https://gg.deals/search/?q={quote(clean_name)}"
 
-    # Sort platforms: specified order first, then alphabetical
-    def platform_sort_key(p):
+
+def platform_emoji(platform):
+    """Map platform names to Discord emoji-like text icons."""
+    p = platform.lower()
+    icons = {
+        "steam": "<:steam:1324567890123456789>",
+    }
+    # Use text emojis since custom emoji IDs would differ per server
+    emoji_map = {
+        "steam": "🟦",
+        "epic": "⭐",
+        "gog": "🟣",
+        "itch.io": "🟥",
+        "itch": "🟥",
+        "xbox": "🟩",
+        "playstation": "🔵",
+        "ps": "🔵",
+        "nintendo": "🔴",
+        "indiegala": "🟠",
+        "microsoft": "🟦",
+        "amazon": "🟧",
+        "pc": "💻",
+        "console": "🎮",
+        "android": "📱",
+        "ios": "📱",
+    }
+    for key, emoji in emoji_map.items():
+        if key in p:
+            return emoji
+    return "🎮"
+
+
+def game_url_icon(content_type):
+    icons = {"game": "🎮", "dlc": "📦", "other": "🎁", "bundle": "📚"}
+    return icons.get(content_type, "🎮")
+
+
+# ── Embed Builder ───────────────────────────────────────────────────────
+def build_embeds(new_entries):
+    """Build shiny Discord embeds with gg.deals links."""
+    # Sort newest first
+    new_entries.sort(key=lambda e: e["published"], reverse=True)
+
+    embed_color = 0xFF6B35  # gg.deals orange
+
+    # Build a clean compact field per game
+    embeds = []
+    current_embed = None
+    field_count = 0
+
+    for entry in new_entries:
+        game = entry["game_name"] or entry["title"]
+        plat = entry["platform"] or "Other"
+        ctype = entry["content_type"] or "game"
+        plut = platform_emoji(plat)
+        cicon = game_url_icon(ctype)
+
+        # Build gg.deals link
+        gglink = gg_deals_url(game)
+        if gglink:
+            link_text = f"[gg.deals]({gglink})"
+        else:
+            link_text = f"[Reddit]({entry['url']})"
+
+        # Format time ago
         try:
-            return (0, PLATFORM_ORDER.index(p))
-        except ValueError:
-            return (1, p.lower())
+            pub = datetime.fromisoformat(entry["published"])
+            now = datetime.now(timezone.utc)
+            diff = now - pub
+            if diff.days > 0:
+                time_str = f"{diff.days}d ago"
+            elif diff.seconds >= 3600:
+                time_str = f"{diff.seconds // 3600}h ago"
+            else:
+                time_str = f"{diff.seconds // 60}m ago"
+        except:
+            time_str = "recent"
 
-    description_parts = []
-    for plat in sorted(by_platform.keys(), key=platform_sort_key):
-        items = by_platform[plat]
-        lines = [f"**{plat}**"]
-        for e in items:
-            ctype_emoji = TYPE_EMOJIS.get(e["content_type"], "🎮")
-            lines.append(
-                f"• {ctype_emoji} **{e['game_name']}** — "
-                f"[[Link]]({e['url']})"
+        # Build embed field value
+        field_value = (
+            f"**Platform:** {plut} {plat}  •  **Type:** {ctype.upper()}  •  **{time_str}**\n"
+            f"**Check prices on:** {link_text}"
+        )
+
+        # Start new embed if needed (max 25 fields per embed)
+        if current_embed is None or field_count >= 25:
+            if current_embed:
+                current_embed.set_footer(
+                    text="gg.deals • Free Games Tracker",
+                    icon_url="https://gg.deals/favicon.ico"
+                )
+                embeds.append(current_embed)
+            current_embed = discord.Embed(
+                title="🆓 **Free Games Found!**",
+                description=f"**{len(new_entries)}** new free games & DLCs available now",
+                color=embed_color,
+                timestamp=datetime.now(timezone.utc),
             )
-        description_parts.append("\n".join(lines))
+            current_embed.set_thumbnail(
+                url="https://gg.deals/favicon-128x128.png"
+            )
+            field_count = 0
 
-    description = "\n\n".join(description_parts)
+        current_embed.add_field(
+            name=f"{cicon} **{game}**",
+            value=field_value,
+            inline=False,
+        )
+        field_count += 1
 
-    # Discord embed description limit is 4096 chars — truncate if needed
-    if len(description) > 4000:
-        description = description[:3997] + "..."
+    # Add the last embed
+    if current_embed:
+        current_embed.set_footer(
+            text="gg.deals • Free Games Tracker",
+            icon_url="https://gg.deals/favicon.ico"
+        )
+        embeds.append(current_embed)
 
-    embed = discord.Embed(
-        title=f"🆓 **{len(new_entries)} Free Game{'s' if len(new_entries) > 1 else ''} Found!**",
-        description=description,
-        color=0x00FF88,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_footer(text="r/FreeGameFindings • New posts since last check")
-    return embed
+    return embeds
 
 
-# ── Main Check Logic ────────────────────────────────────────────────────
+# ── Main Check ─────────────────────────────────────────────────────────
 async def check_free_games():
-    """Fetch RSS, find new entries, post to Discord channel."""
-    logger.info("Checking for free games…")
+    logger.info("🔍 Checking for free games…")
 
     cache = load_cache()
     seen_ids = set(cache.get("seen", []))
-    logger.info(f"Cache has {len(seen_ids)} known entries")
 
     try:
         entries = fetch_feed()
-        logger.info(f"Fetched {len(entries)} entries from RSS")
+        logger.info(f"📡 Fetched {len(entries)} entries from RSS")
     except Exception as e:
-        logger.error(f"Failed to fetch RSS: {e}")
+        logger.error(f"❌ Failed to fetch RSS: {e}")
         return
 
     filtered = [e for e in entries if not should_skip(e)]
-    logger.info(f"{len(filtered)} entries after skip filtering")
-
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
 
     new_entries = []
@@ -213,39 +300,37 @@ async def check_free_games():
             pub = datetime.fromisoformat(entry["published"])
         except (ValueError, TypeError):
             pub = datetime.now(timezone.utc)
-        # First run: only respect lookback window
         if not seen_ids and pub < cutoff:
             continue
         new_entries.append(entry)
 
-    # Always update seen set so we don't re-process
     for e in filtered:
         seen_ids.add(e["id"])
     save_cache(seen_ids)
 
     if not new_entries:
-        logger.info("No new free games since last check.")
+        logger.info("✅ No new free games since last check.")
         return
 
-    new_entries.sort(key=lambda e: e["published"], reverse=True)
-    logger.info(f"{len(new_entries)} new free games to post!")
+    logger.info(f"🎯 {len(new_entries)} new free games!")
 
     channel = bot.get_channel(CHANNEL_ID)
     if channel is None:
-        logger.error(f"Channel {CHANNEL_ID} not found — bot might need re-inviting")
+        logger.error(f"❌ Channel {CHANNEL_ID} not found")
         return
 
-    embed = build_embed(new_entries)
+    embeds = build_embeds(new_entries)
 
     try:
-        await channel.send(embed=embed)
-        logger.info(f"Posted {len(new_entries)} games to channel {CHANNEL_ID}")
+        for embed in embeds:
+            await channel.send(embed=embed)
+        logger.info(f"✅ Posted {len(new_entries)} games in {len(embeds)} embeds")
     except discord.Forbidden:
-        logger.error(f"No permission to send in channel {CHANNEL_ID}")
+        logger.error("❌ No permission to send in channel")
     except discord.HTTPException as e:
-        logger.error(f"Discord API error: {e}")
+        logger.error(f"❌ Discord API error: {e}")
     except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+        logger.error(f"❌ Failed: {e}")
 
 
 # ── Scheduled Task ──────────────────────────────────────────────────────
@@ -262,17 +347,15 @@ async def before_scheduled_check():
 # ── Events ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    logger.info(f"Monitoring channel ID: {CHANNEL_ID}")
-    logger.info(f"Check interval: every {CHECK_INTERVAL_HOURS} hours")
-    # Run first check immediately on connect
+    logger.info(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    logger.info(f"📬 Monitoring channel ID: {CHANNEL_ID}")
+    logger.info(f"⏰ Check interval: every {CHECK_INTERVAL_HOURS} hours")
     await check_free_games()
 
 
 @bot.event
 async def on_guild_join(guild):
-    """When added to a new server, log it."""
-    logger.info(f"Joined guild: {guild.name} (ID: {guild.id})")
+    logger.info(f"🏠 Joined guild: {guild.name} (ID: {guild.id})")
 
 
 # ── Startup ─────────────────────────────────────────────────────────────
