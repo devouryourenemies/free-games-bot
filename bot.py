@@ -18,7 +18,7 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", "1514351100050800763"))
 RSS_URL = "https://www.reddit.com/r/FreeGameFindings/.rss"
 LOOKBACK_HOURS = 72          # How far back to scan on first-ever run
-CHECK_INTERVAL_HOURS = 6     # How often to poll (default: 4x daily)
+CHECK_INTERVAL_HOURS = 24    # How often to poll (daily check)
 DATA_DIR = Path("/data") if os.path.exists("/data") else Path("data")
 CACHE_FILE = DATA_DIR / "seen_games.json"
 
